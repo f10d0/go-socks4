@@ -3,12 +3,16 @@
 package socks4 // import _ "github.com/bdandy/go-socks4"
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"net/url"
 	"strconv"
+	"time"
 
 	errors "github.com/bdandy/go-errors"
+	"github.com/miekg/dns"
+	"github.com/patrickmn/go-cache"
 	"golang.org/x/net/proxy"
 )
 
@@ -41,13 +45,13 @@ const (
 var Ident = "nobody@0.0.0.0"
 
 func init() {
-	proxy.RegisterDialerType("socks4", func(u *url.URL, d proxy.Dialer) (proxy.Dialer, error) {
-		return socks4{url: u, dialer: d}, nil
-	})
-
-	proxy.RegisterDialerType("socks4a", func(u *url.URL, d proxy.Dialer) (proxy.Dialer, error) {
-		return socks4{url: u, dialer: d}, nil
-	})
+	register := func(scheme string) {
+		proxy.RegisterDialerType(scheme, func(u *url.URL, d proxy.Dialer) (proxy.Dialer, error) {
+			return newSocks4(u, d), nil
+		})
+	}
+	register("socks4")
+	register("socks4a")
 }
 
 type Error = errors.Error
@@ -55,6 +59,16 @@ type Error = errors.Error
 type socks4 struct {
 	url    *url.URL
 	dialer proxy.Dialer
+}
+
+var dnsSharedCache = cache.New(cache.NoExpiration, 10*time.Minute)
+var dnsClient = &dns.Client{Timeout: 4 * time.Second}
+
+func newSocks4(u *url.URL, d proxy.Dialer) *socks4 {
+	return &socks4{
+		url:    u,
+		dialer: d,
+	}
 }
 
 // Dial implements proxy.Dialer interface
@@ -79,10 +93,12 @@ func (s socks4) Dial(network, addr string) (c net.Conn, err error) {
 		return nil, ErrWrongAddr.New(addr).Wrap(err)
 	}
 
-	ip := net.IPv4(0, 0, 0, 1)
+	var ip net.IP
 	if !s.isSocks4a() {
-		if ip, err = s.lookupAddr(host); err != nil {
-			return nil, ErrHostUnknown.New(host).Wrap(err)
+		if ip = net.ParseIP(host); ip == nil {
+			if ip, err = s.lookupAddr(host); err != nil {
+				return nil, ErrHostUnknown.New(host).Wrap(err)
+			}
 		}
 	}
 
@@ -120,12 +136,50 @@ func (s socks4) Dial(network, addr string) (c net.Conn, err error) {
 }
 
 func (s socks4) lookupAddr(host string) (net.IP, error) {
-	ip, err := net.ResolveIPAddr("ip4", host)
-	if err != nil {
-		return net.IP{}, err
+	// cache hit
+	if v, ok := dnsSharedCache.Get(host); ok {
+		return v.(net.IP), nil
 	}
 
-	return ip.IP.To4(), nil
+	// query manually
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(host), dns.TypeA)
+
+	// ask system's default resolver
+	resp, _, err := dnsClient.Exchange(msg, getSystemDNSServer())
+	if err != nil {
+		return nil, err
+	}
+	if resp.Rcode != dns.RcodeSuccess {
+		return nil, fmt.Errorf("DNS error: %s", dns.RcodeToString[resp.Rcode])
+	}
+
+	var ip net.IP
+	ttl := uint32(0)
+	for _, ans := range resp.Answer {
+		if aRec, ok := ans.(*dns.A); ok {
+			if ip == nil {
+				ip = aRec.A.To4()
+				ttl = aRec.Hdr.Ttl
+			} else if aRec.Hdr.Ttl < ttl {
+				ttl = aRec.Hdr.Ttl
+			}
+		}
+	}
+	if ip == nil {
+		return nil, fmt.Errorf("no A record for %s", host)
+	}
+
+	dnsSharedCache.Set(host, ip, time.Duration(ttl)*time.Second)
+	return ip, nil
+}
+
+func getSystemDNSServer() string {
+	cfg, _ := dns.ClientConfigFromFile("/etc/resolv.conf")
+	if len(cfg.Servers) == 0 { // fallback
+		return "8.8.8.8:53"
+	}
+	return net.JoinHostPort(cfg.Servers[0], cfg.Port)
 }
 
 func (s socks4) isSocks4a() bool {
